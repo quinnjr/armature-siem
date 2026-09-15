@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Security
+
+- Require `rustls` 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries).
+
 ### Fixed
 
 - `add_to_batch` enforces a ceiling and returns `BatchFull`, a variant nothing previously constructed.
