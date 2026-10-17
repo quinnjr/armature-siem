@@ -9,6 +9,24 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
+### Security
+
+- `SiemConfig`'s `Debug` output redacts `token` and `password` as `[REDACTED]`, so a logged configuration no longer leaks the SIEM credential (H27).
+- Disabling TLS certificate verification now logs a `warn!` every time a transport is built that way (L17).
+- The TLS transport rejects a `ca_cert` file that contains no PEM certificates instead of building an empty root store.
+
+### Changed
+
+- **Breaking:** disabling TLS certificate verification is gated behind the new `dangerous-insecure-tls` cargo feature (not part of `full`). Without it, `tls_verify = false` is rejected by `SiemConfig::validate` and by `HttpTransport::new`/`TcpTransport::new` with `SiemError::Config`, and the `NoServerCertVerification` verifier is not compiled. Migration: trust a private collector with `.ca_cert(path)`; if you really need no verification, enable `dangerous-insecure-tls` and call `.danger_accept_invalid_certs()`.
+- CA certificates are parsed with `rustls-pki-types`' `PemObject` (via rustls' re-export) (M32).
+
+### Removed
+
+- **Breaking:** `SiemConfigBuilder::tls_verify(bool)`. Migration: verification is on by default; use `.ca_cert(path)`, or `.danger_accept_invalid_certs()` behind the `dangerous-insecure-tls` feature.
+- The `rustls-pemfile` dependency (unmaintained, RUSTSEC-2025-0134) (M32).
+
 ## [0.3.0] - 2026-09-15
 
 ### Changed

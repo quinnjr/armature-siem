@@ -1,6 +1,6 @@
 [package]
 name = "armature-siem"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.94.1"
 authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
@@ -12,8 +12,8 @@ keywords = ["siem", "security", "logging", "splunk", "elastic"]
 categories = ["web-programming", "development-tools::debugging"]
 
 [dependencies]
-armature-core = { version = "0.10", optional = true }
-armature-audit = { version = "0.4", optional = true }
+armature-core = { version = "0.11", optional = true }
+armature-audit = { version = "0.5", optional = true }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -37,7 +37,6 @@ hmac = "0.13.0"
 sha2 = "0.11"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls-pemfile = "2.2"
 webpki-roots = "1.0"
 flate2 = "1.1.10"
 
@@ -54,3 +53,8 @@ di = ["armature-core"]
 audit = ["armature-audit"]
 http = ["reqwest"]
 full = ["di", "audit", "http"]
+# Allows `SiemConfigBuilder::danger_accept_invalid_certs` / `tls_verify = false`
+# (disables server certificate verification; logs a warning when used).
+# Deliberately NOT part of `full`: without it, disabling verification is a
+# configuration error. Prefer `ca_cert` for self-signed collectors.
+dangerous-insecure-tls = []
