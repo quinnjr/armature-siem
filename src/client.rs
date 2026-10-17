@@ -364,7 +364,11 @@ impl HttpTransport {
             .timeout(config.request_timeout);
 
         if !config.tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
+            crate::config::insecure_tls_allowed(&config.endpoint)?;
+            #[cfg(feature = "dangerous-insecure-tls")]
+            {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
         }
 
         if let Some(ca_path) = &config.ca_cert_path {
@@ -584,19 +588,22 @@ impl SiemTransport for HttpTransport {
 
 /// Certificate verifier that disables server certificate validation.
 ///
-/// Only used when `SiemConfig::tls_verify` is explicitly set to `false`.
-/// SIEM/syslog endpoints are frequently internal, self-signed collectors,
-/// so this is an intentional, opt-in escape hatch — it must never be the
-/// default and must never be selected implicitly.
+/// Only compiled with the `dangerous-insecure-tls` feature, and only used when
+/// `SiemConfig::tls_verify` is explicitly set to `false`. It must never be the
+/// default and must never be selected implicitly; a private collector should be
+/// trusted through `ca_cert` instead.
+#[cfg(feature = "dangerous-insecure-tls")]
 #[derive(Debug)]
 struct NoServerCertVerification(rustls::crypto::CryptoProvider);
 
+#[cfg(feature = "dangerous-insecure-tls")]
 impl NoServerCertVerification {
     fn new(provider: rustls::crypto::CryptoProvider) -> Arc<Self> {
         Arc::new(Self(provider))
     }
 }
 
+#[cfg(feature = "dangerous-insecure-tls")]
 impl rustls::client::danger::ServerCertVerifier for NoServerCertVerification {
     fn verify_server_cert(
         &self,
@@ -662,6 +669,9 @@ impl TcpTransport {
         let ca_cert_path = config.ca_cert_path.clone();
 
         let tls_connector = if tls {
+            if !tls_verify {
+                crate::config::insecure_tls_allowed(&config.endpoint)?;
+            }
             Some(Self::build_tls_connector(tls_verify, &ca_cert_path)?)
         } else {
             None
@@ -677,7 +687,8 @@ impl TcpTransport {
     /// Build a rustls-based TLS connector honoring `tls_verify` / `ca_cert_path`.
     ///
     /// Never falls back to a permissive default: verification is only
-    /// disabled when `tls_verify` is explicitly `false`.
+    /// disabled when `tls_verify` is explicitly `false` *and* the crate was
+    /// built with `dangerous-insecure-tls`; otherwise that is an error.
     ///
     /// Called once from `new()` (so a bad `ca_cert_path` surfaces as a
     /// construction-time error) rather than per-`send`.
@@ -687,49 +698,70 @@ impl TcpTransport {
     ) -> SiemResult<tokio_rustls::TlsConnector> {
         let provider = rustls::crypto::ring::default_provider();
 
-        let client_config = if !tls_verify {
-            rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    SiemError::Transport(format!("Failed to configure TLS protocol: {}", e))
-                })?
-                .dangerous()
-                .with_custom_certificate_verifier(NoServerCertVerification::new(provider))
-                .with_no_client_auth()
-        } else {
-            let mut roots = rustls::RootCertStore::empty();
+        if !tls_verify {
+            #[cfg(feature = "dangerous-insecure-tls")]
+            {
+                tracing::warn!("SIEM TLS transport built with certificate verification DISABLED");
+                let client_config =
+                    rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+                        .with_safe_default_protocol_versions()
+                        .map_err(|e| {
+                            SiemError::Transport(format!("Failed to configure TLS protocol: {}", e))
+                        })?
+                        .dangerous()
+                        .with_custom_certificate_verifier(NoServerCertVerification::new(provider))
+                        .with_no_client_auth();
+                return Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config)));
+            }
+            #[cfg(not(feature = "dangerous-insecure-tls"))]
+            {
+                return Err(SiemError::Config(
+                    "tls_verify = false requires the `dangerous-insecure-tls` feature of armature-siem"
+                        .to_string(),
+                ));
+            }
+        }
 
-            if let Some(ca_path) = ca_cert_path {
-                let file = std::fs::File::open(ca_path).map_err(|e| {
+        let mut roots = rustls::RootCertStore::empty();
+
+        if let Some(ca_path) = ca_cert_path {
+            use rustls::pki_types::CertificateDer;
+            use rustls::pki_types::pem::PemObject;
+
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                SiemError::Transport(format!(
+                    "Failed to open CA certificate '{}': {}",
+                    ca_path, e
+                ))
+            })?;
+            let mut added = 0usize;
+            for cert in CertificateDer::pem_slice_iter(&pem) {
+                let cert = cert.map_err(|e| {
+                    SiemError::Transport(format!("Failed to parse CA certificate: {}", e))
+                })?;
+                roots.add(cert).map_err(|e| {
                     SiemError::Transport(format!(
-                        "Failed to open CA certificate '{}': {}",
-                        ca_path, e
+                        "Failed to add CA certificate to root store: {}",
+                        e
                     ))
                 })?;
-                let mut reader = std::io::BufReader::new(file);
-                for cert in rustls_pemfile::certs(&mut reader) {
-                    let cert = cert.map_err(|e| {
-                        SiemError::Transport(format!("Failed to parse CA certificate: {}", e))
-                    })?;
-                    roots.add(cert).map_err(|e| {
-                        SiemError::Transport(format!(
-                            "Failed to add CA certificate to root store: {}",
-                            e
-                        ))
-                    })?;
-                }
-            } else {
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                added += 1;
             }
+            if added == 0 {
+                return Err(SiemError::Transport(format!(
+                    "CA certificate file '{}' contains no PEM certificates",
+                    ca_path
+                )));
+            }
+        } else {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
 
-            rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    SiemError::Transport(format!("Failed to configure TLS protocol: {}", e))
-                })?
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        };
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| SiemError::Transport(format!("Failed to configure TLS protocol: {}", e)))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
 
         Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
     }
@@ -1356,9 +1388,11 @@ mod tests {
     }
 
     /// Build a self-signed rustls `ServerConfig` for `localhost` using rcgen,
-    /// for standing up an in-test TLS listener.
-    fn self_signed_server_config() -> rustls::ServerConfig {
+    /// for standing up an in-test TLS listener. Also returns the certificate as
+    /// PEM so a client can trust it through `ca_cert_path`.
+    fn self_signed_server_config() -> (rustls::ServerConfig, String) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
         let cert_der = cert.cert.der().clone();
         let key_der =
             rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
@@ -1367,18 +1401,30 @@ mod tests {
         // `ring` and `aws-lc-rs` rustls backends can be present, which makes the
         // process-default provider ambiguous. The production connector pins ring
         // the same way (see `build_tls_connector`).
-        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
-        .unwrap()
+        .unwrap();
+        (server_config, cert_pem)
     }
 
-    fn tcp_tls_transport(endpoint: String, tls_verify: bool) -> TcpTransport {
-        let tls_connector = TcpTransport::build_tls_connector(tls_verify, &None)
+    /// Write `contents` to a uniquely named file in the system temp directory.
+    fn temp_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("armature-siem-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn tcp_tls_transport(
+        endpoint: String,
+        tls_verify: bool,
+        ca_cert_path: Option<String>,
+    ) -> TcpTransport {
+        let tls_connector = TcpTransport::build_tls_connector(tls_verify, &ca_cert_path)
             .expect("build tls connector for test transport");
         TcpTransport {
             endpoint,
@@ -1387,33 +1433,46 @@ mod tests {
         }
     }
 
-    /// A `tls=true` transport must complete a real TLS handshake and deliver
-    /// the event over the encrypted stream, not plaintext TCP.
-    #[tokio::test]
-    async fn test_tls_transport_delivers_over_encrypted_channel() {
+    /// Accept one TLS connection and return the first line it sends.
+    async fn spawn_tls_line_server(
+        server_config: rustls::ServerConfig,
+    ) -> (u16, tokio::task::JoinHandle<String>) {
         use tokio::net::TcpListener;
 
-        let server_config = Arc::new(self_signed_server_config());
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                return String::new();
+            };
 
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut reader = BufReader::new(&mut tls_stream);
             let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
+            let _ = reader.read_line(&mut line).await;
             line
         });
+        (port, server)
+    }
 
-        // tls_verify=false: the listener uses a self-signed cert not in any
-        // root store, so verification must be explicitly disabled for this
-        // test to exercise the encrypted round trip.
-        let transport = tcp_tls_transport(format!("localhost:{}", port), false);
+    /// A `tls=true` transport must complete a real, *verified* TLS handshake
+    /// (the collector's self-signed cert is trusted through `ca_cert_path`,
+    /// parsed with `PemObject`) and deliver the event over the encrypted
+    /// stream, not plaintext TCP.
+    #[tokio::test]
+    async fn test_tls_transport_delivers_over_encrypted_channel() {
+        let (server_config, cert_pem) = self_signed_server_config();
+        let ca_path = temp_file(&cert_pem);
+        let (port, server) = spawn_tls_line_server(server_config).await;
+
+        let transport = tcp_tls_transport(
+            format!("localhost:{}", port),
+            true,
+            Some(ca_path.to_string_lossy().into_owned()),
+        );
 
         transport
             .send("encrypted security event", "text/plain")
@@ -1421,7 +1480,85 @@ mod tests {
             .expect("TLS send should succeed and complete a handshake");
 
         let received = server.await.unwrap();
+        let _ = std::fs::remove_file(&ca_path);
         assert_eq!(received.trim_end(), "encrypted security event");
+    }
+
+    /// With verification on and the collector's certificate *not* trusted, the
+    /// handshake must fail and the event must not be delivered.
+    #[tokio::test]
+    async fn test_tls_transport_rejects_untrusted_certificate() {
+        let (server_config, _) = self_signed_server_config();
+        let (port, server) = spawn_tls_line_server(server_config).await;
+
+        let transport = tcp_tls_transport(format!("localhost:{}", port), true, None);
+        let result = transport.send("must not arrive", "text/plain").await;
+        assert!(result.is_err(), "untrusted certificate must be rejected");
+
+        let received = server.await.unwrap();
+        assert!(!received.contains("must not arrive"));
+    }
+
+    /// A CA file with no certificate in it is a configuration mistake and must
+    /// error rather than silently produce an empty (useless) root store.
+    #[test]
+    fn test_ca_file_without_certificates_is_rejected() {
+        let path = temp_file("not a certificate\n");
+        let result =
+            TcpTransport::build_tls_connector(true, &Some(path.to_string_lossy().into_owned()));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    /// Without `dangerous-insecure-tls`, turning verification off fails closed
+    /// in the transport constructor too (the public field can be set after
+    /// `validate()`).
+    #[cfg(not(feature = "dangerous-insecure-tls"))]
+    #[test]
+    fn test_tls_verify_false_rejected_without_feature() {
+        let mut config = SiemConfig::builder()
+            .provider(crate::SiemProvider::Syslog)
+            .transport(Transport::Tls)
+            .endpoint("localhost:6514")
+            .build()
+            .unwrap();
+        config.tls_verify = false;
+
+        assert!(matches!(
+            TcpTransport::new(&config),
+            Err(SiemError::Config(_))
+        ));
+        assert!(TcpTransport::build_tls_connector(false, &None).is_err());
+
+        #[cfg(feature = "http")]
+        {
+            let mut config = SiemConfig::builder()
+                .provider(crate::SiemProvider::Custom)
+                .endpoint("https://collector.example.com")
+                .build()
+                .unwrap();
+            config.tls_verify = false;
+            assert!(matches!(
+                HttpTransport::new(&config),
+                Err(SiemError::Config(_))
+            ));
+        }
+    }
+
+    /// With `dangerous-insecure-tls`, an explicit opt-out still reaches a
+    /// self-signed collector.
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[tokio::test]
+    async fn test_tls_verify_false_allowed_with_feature() {
+        let (server_config, _) = self_signed_server_config();
+        let (port, server) = spawn_tls_line_server(server_config).await;
+
+        let transport = tcp_tls_transport(format!("localhost:{}", port), false, None);
+        transport
+            .send("insecure but opted in", "text/plain")
+            .await
+            .expect("opted-in insecure TLS should connect");
+        assert_eq!(server.await.unwrap().trim_end(), "insecure but opted in");
     }
 
     /// A `tls=true` transport pointed at a plaintext listener must NOT
@@ -1443,7 +1580,7 @@ mod tests {
             buf[..n].to_vec()
         });
 
-        let transport = tcp_tls_transport(format!("127.0.0.1:{}", port), false);
+        let transport = tcp_tls_transport(format!("127.0.0.1:{}", port), true, None);
 
         let result = transport.send("top secret event", "text/plain").await;
         assert!(

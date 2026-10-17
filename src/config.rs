@@ -116,7 +116,11 @@ pub enum SyslogFacility {
 }
 
 /// SIEM client configuration
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand so the authentication `token` and basic-auth
+/// `password` are printed as `[REDACTED]`: a configuration dumped into a log
+/// line must not carry the credential to the log store.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct SiemConfig {
     /// Target SIEM provider
@@ -151,7 +155,13 @@ pub struct SiemConfig {
     pub batch_size: usize,
     /// Batch flush interval
     pub batch_flush_interval: Duration,
-    /// Enable TLS certificate verification
+    /// Verify the server's TLS certificate (default `true`).
+    ///
+    /// `false` is only honored when the crate is built with the
+    /// `dangerous-insecure-tls` feature. Without it, [`SiemConfig::validate`]
+    /// and every transport constructor reject the configuration, so a
+    /// verification switch flipped by mistake fails closed instead of sending
+    /// security events to whoever answers on the endpoint.
     pub tls_verify: bool,
     /// Custom CA certificate path
     pub ca_cert_path: Option<String>,
@@ -206,6 +216,67 @@ impl Default for SiemConfig {
     }
 }
 
+const REDACTED: &str = "[REDACTED]";
+
+impl std::fmt::Debug for SiemConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiemConfig")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("format", &self.format)
+            .field("transport", &self.transport)
+            .field("token", &self.token.as_ref().map(|_| REDACTED))
+            .field("workspace_id", &self.workspace_id)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("index", &self.index)
+            .field("source_type", &self.source_type)
+            .field("source", &self.source)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("batching_enabled", &self.batching_enabled)
+            .field("batch_size", &self.batch_size)
+            .field("batch_flush_interval", &self.batch_flush_interval)
+            .field("tls_verify", &self.tls_verify)
+            .field("ca_cert_path", &self.ca_cert_path)
+            .field("syslog_facility", &self.syslog_facility)
+            .field("app_name", &self.app_name)
+            .field("cef_vendor", &self.cef_vendor)
+            .field("cef_product", &self.cef_product)
+            .field("cef_version", &self.cef_version)
+            .field("compression", &self.compression)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .finish()
+    }
+}
+
+/// Gate for a configuration that disables TLS certificate verification.
+///
+/// With the `dangerous-insecure-tls` feature this logs a warning and allows
+/// it; without the feature it is a configuration error. Every place that
+/// would act on `tls_verify == false` calls this first, so the field cannot
+/// be flipped after [`SiemConfig::validate`] to sneak past the check.
+pub(crate) fn insecure_tls_allowed(endpoint: &str) -> Result<(), SiemError> {
+    #[cfg(feature = "dangerous-insecure-tls")]
+    {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "SIEM TLS certificate verification is DISABLED: events can be read or altered by anyone able to intercept the connection"
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "dangerous-insecure-tls"))]
+    {
+        let _ = endpoint;
+        Err(SiemError::Config(
+            "tls_verify = false requires the `dangerous-insecure-tls` feature of armature-siem; \
+             trust a private collector with `ca_cert` instead"
+                .to_string(),
+        ))
+    }
+}
+
 impl SiemConfig {
     /// Create a new config builder
     pub fn builder() -> SiemConfigBuilder {
@@ -216,6 +287,10 @@ impl SiemConfig {
     pub fn validate(&self) -> Result<(), SiemError> {
         if self.endpoint.is_empty() {
             return Err(SiemError::Config("Endpoint is required".to_string()));
+        }
+
+        if !self.tls_verify {
+            insecure_tls_allowed(&self.endpoint)?;
         }
 
         // Validate transport/endpoint combinations
@@ -367,9 +442,15 @@ impl SiemConfigBuilder {
         self
     }
 
-    /// Enable/disable TLS verification
-    pub fn tls_verify(mut self, verify: bool) -> Self {
-        self.config.tls_verify = verify;
+    /// Disable TLS certificate verification.
+    ///
+    /// Only exists with the `dangerous-insecure-tls` feature, and logs a
+    /// warning whenever a transport is built from the resulting config. For a
+    /// self-signed or private collector, prefer [`SiemConfigBuilder::ca_cert`],
+    /// which keeps verification on against your own CA.
+    #[cfg(feature = "dangerous-insecure-tls")]
+    pub fn danger_accept_invalid_certs(mut self) -> Self {
+        self.config.tls_verify = false;
         self
     }
 
@@ -471,5 +552,63 @@ mod tests {
 
         assert_eq!(config.format, EventFormat::Leef);
         assert_eq!(config.transport, Transport::Tcp);
+    }
+
+    #[test]
+    fn debug_redacts_token_and_password() {
+        let config = SiemConfig::builder()
+            .provider(SiemProvider::Splunk)
+            .endpoint("https://splunk.example.com:8088")
+            .token("hec-token-super-secret")
+            .basic_auth("svc-user", "basic-password-super-secret")
+            .build()
+            .unwrap();
+
+        let debug = format!("{:?}", config);
+        assert!(!debug.contains("hec-token-super-secret"), "{debug}");
+        assert!(!debug.contains("basic-password-super-secret"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        // Non-secret fields stay visible for troubleshooting.
+        assert!(debug.contains("svc-user"), "{debug}");
+        assert!(debug.contains("splunk.example.com"), "{debug}");
+    }
+
+    #[test]
+    fn tls_verify_defaults_on() {
+        assert!(SiemConfig::default().tls_verify);
+    }
+
+    /// Without `dangerous-insecure-tls`, a config with verification off is
+    /// rejected at validation time even when the public field is set directly.
+    #[cfg(not(feature = "dangerous-insecure-tls"))]
+    #[test]
+    fn disabling_tls_verification_fails_closed_without_feature() {
+        let mut config = SiemConfig::builder()
+            .provider(SiemProvider::Syslog)
+            .transport(Transport::Tls)
+            .endpoint("collector.example.com:6514")
+            .build()
+            .unwrap();
+        config.tls_verify = false;
+
+        match config.validate() {
+            Err(SiemError::Config(msg)) => {
+                assert!(msg.contains("dangerous-insecure-tls"), "{msg}")
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[test]
+    fn disabling_tls_verification_allowed_with_feature() {
+        let config = SiemConfig::builder()
+            .provider(SiemProvider::Syslog)
+            .transport(Transport::Tls)
+            .endpoint("collector.example.com:6514")
+            .danger_accept_invalid_certs()
+            .build()
+            .unwrap();
+        assert!(!config.tls_verify);
     }
 }

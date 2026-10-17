@@ -37,7 +37,6 @@ hmac = "0.13.0"
 sha2 = "0.11"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls-pemfile = "2.2"
 webpki-roots = "1.0"
 flate2 = "1.1.10"
 
@@ -54,3 +53,8 @@ di = ["armature-core"]
 audit = ["armature-audit"]
 http = ["reqwest"]
 full = ["di", "audit", "http"]
+# Allows `SiemConfigBuilder::danger_accept_invalid_certs` / `tls_verify = false`
+# (disables server certificate verification; logs a warning when used).
+# Deliberately NOT part of `full`: without it, disabling verification is a
+# configuration error. Prefer `ca_cert` for self-signed collectors.
+dangerous-insecure-tls = []
