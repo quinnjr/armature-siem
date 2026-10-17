@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
 ### Security
 
 - `SiemConfig`'s `Debug` output redacts `token` and `password` as `[REDACTED]`, so a logged configuration no longer leaks the SIEM credential (H27).
